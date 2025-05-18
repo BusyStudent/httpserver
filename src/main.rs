@@ -1,15 +1,19 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::str::{self, Chars};
 
 // Parse the given string and return the method and path
-fn parse_http_request(line: &str) -> Option<(&str, &str)> {
-    let vec : Vec::<&str> = line.split(" ").collect();
-    if vec.len() != 3 {
+fn parse_request_line(line: &str) -> Option<(&str, &str)> {
+    let mut s = line.split(" ");
+    let method = s.next()?;
+    let path = s.next()?;
+    let _ver = s.next()?;
+    if !s.next().is_none() { // It should just 3 items
         return None;
     }
-    return Some((vec[0], vec[1]));
+    return Some((method, path));
 }
 
 fn status_code_to_string(code: i32) -> &'static str {
@@ -60,7 +64,12 @@ fn gen_fs_page(path: &str) -> Result<Vec::<u8>, std::io::Error> {
         content.push_str("<html><meta charset=\"utf-8\" /><body><ul>");
         for dir in std::fs::read_dir(path)? {
             let name = dir?.file_name().to_string_lossy().into_owned();
-            content.push_str(&format!("<li><a href=\"{}\">{}</a></li>", name, name));
+            let mut pathname = String::from(path);
+            if !pathname.ends_with("/") {
+                pathname.push('/');
+            }
+            pathname.push_str(&encode_url(name.as_str()));
+            content.push_str(&format!("<li><a href=\"{}\">{}</a></li>", pathname, name));
         }
         content.push_str("</ul></body></html>");
         return Ok(content.into_bytes());
@@ -68,6 +77,72 @@ fn gen_fs_page(path: &str) -> Result<Vec::<u8>, std::io::Error> {
     else {
         return Ok(std::fs::read(path)?);
     }
+}
+
+fn decode_url(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    let read = |chars: &mut Chars<'_> | -> Option<u8> {
+        let h1 = chars.next()?;
+        let h2 = chars.next()?;
+        let hex = format!("{h1}{h2}");
+        return Some(u8::from_str_radix(hex.as_str(), 16).ok()?);
+    };
+    while let Some(c) = chars.next() {
+        if c == '%' { // Got Utf8 code point here
+            let byte = read(&mut chars)?;
+            if byte < 127 {
+                out.push(char::from_u32(byte as u32)?);
+                continue;
+            }
+            let mut codepoints = Vec::<u8>::new();
+            codepoints.push(byte);
+            loop {
+                match str::from_utf8(codepoints.as_slice()) {
+                    Ok(s) => {
+                        out.push_str(s);
+                        break;
+                    },
+                    Err(_) => {
+                        // Collect the next codepoint
+                        let next = chars.next()?;
+                        if next != '%' {
+                            // Utf8 sequence end !!!
+                            return None;
+                        }
+                        codepoints.push(read(&mut chars)?);
+                    }
+                }
+            }
+        }
+        else {
+            out.push(c);
+        }
+    }
+
+    Some(out)
+}
+
+fn encode_url(s: &str) -> String {
+    let mut out = String::new();
+
+    for ch in s.chars() {
+        if ch.is_ascii() {
+            if ch.is_ascii_alphabetic() || ch.is_ascii_digit() ||  ch == '-' || ch == '_' || ch == '.' || ch == '~' {
+                // Is Part of char can directly sent
+                out.push(ch);
+                continue;
+            }
+        }
+        // We need to encode it
+        let mut buffer = [0u8; 4];
+        for uchar in ch.encode_utf8(&mut buffer).as_bytes() {
+            out.push('%');
+            out.push_str(&format!("{uchar:X}"));
+        }
+    }
+
+    return out;
 }
 
 fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
@@ -86,8 +161,12 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
             println!("EOF, Quiting...");
             return Ok(());
         }
-        let (method, path) = match parse_http_request(buffer.trim()) {
+        let (method, path) = match parse_request_line(buffer.trim()) {
             Some(some) => some,
+            None => return Ok(()),
+        };
+        let path = match decode_url(path) {
+            Some(what) => what,
             None => return Ok(()),
         };
         println!("method {method} path {path}");
@@ -110,15 +189,18 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
                 write_bad_reply(&mut stream)?;
                 return Ok(());
             }
-            headers.insert(String::from(kvs[0]), String::from(kvs[1]));
+            headers.insert(String::from(kvs[0].trim()), String::from(kvs[1].trim()));
             line.clear();
         }
         println!("headers: {:?}", headers);
 
         // Dispatch path by query
-        match gen_fs_page(path) {
+        match gen_fs_page(path.as_str()) {
             Ok(content) => write_reply(&mut stream, 200, content.as_slice())?,
-            Err(_) => write_reply(&mut stream, 404, "<html>404</html>".as_bytes())?
+            Err(err) => match err.kind() {
+                ErrorKind::NotFound => write_reply(&mut stream, 404, "<html>404</html>".as_bytes())?,
+                _ => write_reply(&mut stream, 500, "<html>500</html>".as_bytes())?
+            }
         }
     }
 }
