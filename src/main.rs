@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::TcpListener;
-use std::net::TcpStream;
+use std::io;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ErrorKind};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use std::str::{self, Chars};
 
 // Parse the given string and return the method and path
@@ -39,27 +40,27 @@ fn status_code_to_string(code: i32) -> &'static str {
     }
 }
 
-fn write_reply(stream: &mut TcpStream, code: i32, content: &[u8]) -> Result<(), std::io::Error> {
+async fn write_reply(stream:  &mut (impl AsyncWriteExt + Unpin), code: i32, content: &[u8]) -> io::Result<()> {
     let reply = format!(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n",
         code,
         status_code_to_string(code),
         content.len()
     );
-    stream.write_all(reply.as_bytes())?;
-    stream.write_all(content)?;
-    stream.flush()?;
+    stream.write_all(reply.as_bytes()).await?;
+    stream.write_all(content).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-fn write_bad_reply(stream: &mut TcpStream) -> Result<(), std::io::Error> {
-    write_reply(stream, 500, "<html>bad requests</html>".as_bytes())?;
+async fn write_bad_reply(stream: &mut (impl AsyncWriteExt + Unpin)) -> io::Result<()> {
+    write_reply(stream, 500, "<html>bad requests</html>".as_bytes()).await?;
     Ok(())
 }
 
-fn gen_fs_page(path: &str) -> Result<Vec::<u8>, std::io::Error> {
+async fn gen_fs_page(path: &str) -> io::Result<Vec::<u8> > {
     // Dispatch path by query
-    if std::fs::metadata(path)?.is_dir() {
+    if tokio::fs::metadata(path).await?.is_dir() {
         let mut content = String::new();
         content.push_str("<html><meta charset=\"utf-8\" /><body><ul>");
         for dir in std::fs::read_dir(path)? {
@@ -75,7 +76,7 @@ fn gen_fs_page(path: &str) -> Result<Vec::<u8>, std::io::Error> {
         return Ok(content.into_bytes());
     }
     else {
-        return Ok(std::fs::read(path)?);
+        return Ok(tokio::fs::read(path).await?);
     }
 }
 
@@ -145,19 +146,19 @@ fn encode_url(s: &str) -> String {
     return out;
 }
 
-fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
+async fn handle_client(mut stream: TcpStream) -> io::Result<()> {
     // First Get the first line
     let peeraddr = stream.peer_addr()?;
     println!("handling peer {peeraddr}");
 
-    let reader_stream = stream.try_clone()?;
-    let mut reader = BufReader::new(reader_stream);
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
 
     loop { // For Handle each per requests
         let mut buffer = String::new();
 
         // Read All Http Headers
-        if reader.read_line(&mut buffer)? == 0 { // EOF
+        if reader.read_line(&mut buffer).await? == 0 { // EOF
             println!("EOF, Quiting...");
             return Ok(());
         }
@@ -175,7 +176,7 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
         let mut headers = HashMap::new();
         let mut line = String::new();
         loop {
-            if reader.read_line(&mut line)? == 0 {
+            if reader.read_line(&mut line).await? == 0 {
                 return Ok(());
             }
             let myline = line.trim();
@@ -186,7 +187,7 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
             let kvs : Vec<&str> = myline.split(": ").collect();
             if kvs.len() != 2 {
                 println!("parse the headers failed, expected 2, got {}", kvs.len());
-                write_bad_reply(&mut stream)?;
+                write_bad_reply(&mut writer).await?;
                 return Ok(());
             }
             headers.insert(String::from(kvs[0].trim()), String::from(kvs[1].trim()));
@@ -195,18 +196,19 @@ fn handle_client(mut stream: TcpStream) -> Result<(), std::io::Error> {
         println!("headers: {:?}", headers);
 
         // Dispatch path by query
-        match gen_fs_page(path.as_str()) {
-            Ok(content) => write_reply(&mut stream, 200, content.as_slice())?,
+        match gen_fs_page(path.as_str()).await {
+            Ok(content) => write_reply(&mut writer, 200, content.as_slice()).await?,
             Err(err) => match err.kind() {
-                ErrorKind::NotFound => write_reply(&mut stream, 404, "<html>404</html>".as_bytes())?,
-                _ => write_reply(&mut stream, 500, "<html>500</html>".as_bytes())?
+                ErrorKind::NotFound => write_reply(&mut writer, 404, "<html>404</html>".as_bytes()).await?,
+                _ => write_reply(&mut writer, 500, "<html>500</html>".as_bytes()).await?
             }
         }
     }
 }
 
-fn main() {
-    let listener = match TcpListener::bind("127.0.0.1:25565") {
+#[tokio::main]
+async fn main() {
+    let listener = match TcpListener::bind("127.0.0.1:25565").await {
         Ok(what) => what,
         Err(err) => {
             println!("failed to create a tcp listener by {err}");
@@ -215,7 +217,7 @@ fn main() {
     };
     println!("Listen on {}", listener.local_addr().expect("it should never fail"));
     loop {
-        let (stream, addr) = match listener.accept() {
+        let (stream, addr) = match listener.accept().await {
             Ok(what) => what,
             Err(err) => {
                 println!("failed to accept tcp listener {err}");
@@ -223,8 +225,8 @@ fn main() {
             }
         };
         println!("incoming client from {addr}");
-        std::thread::spawn(|| {
-            if let Err(e) = handle_client(stream) {
+        tokio::task::spawn(async move {
+            if let Err(e) = handle_client(stream).await {
                 println!("Error handling client: {}", e);
             }
         });
